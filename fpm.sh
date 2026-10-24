@@ -750,18 +750,9 @@ update_profiles_ini() {
   local n
   n="$(next_profile_number "$ini")"
 
-  if [[ ! -f "$ini" || ! -s "$ini" ]]; then
-    {
-      printf '[General]\n'
-      printf 'StartWithLastProfile=1\n'
-      printf 'Version=2\n'
-      printf '\n'
-    } > "$ini"
-  else
-    printf '\n' >> "$ini"
-  fi
-
-  {
+  # Build the [ProfileN] section text (used in each branch below).
+  local block
+  block="$( {
     printf '[Profile%d]\n' "$n"
     printf 'Name=%s\n' "$name"
     printf 'IsRelative=1\n'
@@ -769,7 +760,100 @@ update_profiles_ini() {
     if [[ -n "$storeid" ]]; then
       printf 'StoreID=%s\n' "$storeid"
     fi
-  } >> "$ini"
+  } )"
+
+  # If the file does not exist yet, create it with a [General] block and the
+  # new profile.
+  if [[ ! -f "$ini" || ! -s "$ini" ]]; then
+    {
+      printf '[General]\n'
+      printf 'StartWithLastProfile=1\n'
+      printf 'Version=2\n'
+      printf '\n'
+      printf '%s\n' "$block"
+    } > "$ini"
+    return 0
+  fi
+
+  # Otherwise, rewrite the file so the new [ProfileN] section lands right
+  # after the [General] block and before any [Install...]/[Profile...]
+  # sections. This matches Firefox's expected layout ([General], [Profile*],
+  # [Install*]) and avoids appending the profile after an [Install*] block.
+  # It also normalises StartWithLastProfile to 1 so the imported profile can
+  # be selected on startup.
+  local tmp
+  tmp="$ini.tmp"
+  : > "$tmp"
+
+  local section="" in_general=0 written=0
+  local has_start=0 has_version=0
+  local line trimmed
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+
+    if [[ "$trimmed" == [* ]]; then
+      section="${trimmed#[}"
+      section="${section%]}"
+
+      # Leaving [General] and about to enter another section: flush the
+      # profile and any missing [General] keys first.
+      if (( in_general )) && (( ! written )) && [[ "$section" != General* ]]; then
+        {
+          (( has_start ))  || printf 'StartWithLastProfile=1\n'
+          (( has_version )) || printf 'Version=2\n'
+          printf '\n'
+          printf '%s\n' "$block"
+          printf '\n'
+        } >> "$tmp"
+        written=1
+        in_general=0
+      fi
+
+      if [[ "$section" == General* ]]; then
+        in_general=1
+      fi
+    fi
+
+    # While in [General], rewrite StartWithLastProfile=0 to 1 and track which
+    # keys are present.
+    if (( in_general )); then
+      if [[ "$trimmed" == StartWithLastProfile=* ]]; then
+        has_start=1
+        line='StartWithLastProfile=1'
+      elif [[ "$trimmed" == Version=* ]]; then
+        has_version=1
+      fi
+    fi
+
+    printf '%s\n' "$line" >> "$tmp"
+  done < "$ini"
+
+  # If the file ended while still inside [General] (or never contained another
+  # section), flush the profile after it.
+  if (( in_general )) && (( ! written )); then
+    {
+      (( has_start ))  || printf 'StartWithLastProfile=1\n'
+      (( has_version )) || printf 'Version=2\n'
+      printf '\n'
+      printf '%s\n' "$block"
+      printf '\n'
+    } >> "$tmp"
+    written=1
+  fi
+
+  # If there was no [General] block at all, prepend one plus the new profile.
+  if (( ! written )); then
+    {
+      printf '[General]\n'
+      printf 'StartWithLastProfile=1\n'
+      printf 'Version=2\n'
+      printf '\n'
+      printf '%s\n' "$block"
+      printf '\n'
+    } >> "$tmp"
+  fi
+
+  mv "$tmp" "$ini"
 }
 
 cmd_import() {
