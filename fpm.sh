@@ -28,6 +28,13 @@
 #                             one is found; accepts a path or native/snap/flatpak).
 #              ARCHIVE        The zip archive produced by "export".
 #
+#   delete   Delete a profile by name, removing it from profiles.ini and the
+#            SQLite profile store. The on-disk profile directory is left in
+#            place.
+#              ./fpm.sh delete NAME
+#              --name NAME    Name of the profile to delete (or pass as a
+#                             positional argument).
+#
 #   help     Show usage information.
 #              ./fpm.sh help
 
@@ -54,6 +61,7 @@ Commands:
           Profiles are read from both profiles.ini and the new SQLite store.
   export  Export a profile directory as a zip archive.
   import  Import a profile from a zip archive.
+  delete  Delete a profile by name (from profiles.ini and the SQLite store).
   help    Show this help message.
 
 Export options:
@@ -65,6 +73,12 @@ Import options:
   --name NAME    Name for the imported profile (default: Default).
   --dir DIR      Target Firefox directory (required if more than one exists).
   ARCHIVE        The zip archive to import.
+
+Delete options:
+  NAME           Name of the profile to delete.
+  --name NAME    Name of the profile to delete.
+
+Note: delete removes the profile's registration; the on-disk directory is kept.
 EOF
 }
 
@@ -85,6 +99,7 @@ TARGET_DIR=""
 known_firefox_dirs() {
   local d
   for d in \
+    "$HOME/.config/mozilla/firefox" \
     "$HOME/.mozilla/firefox" \
     "$HOME/snap/firefox/common/.mozilla/firefox" \
     "$HOME/.var/app/org.mozilla.firefox/.mozilla/firefox"; do
@@ -859,6 +874,123 @@ cmd_import() {
 }
 
 # ---------------------------------------------------------------------------
+# Delete
+# ---------------------------------------------------------------------------
+
+cmd_delete() {
+  local name=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)
+        [[ -n "${2:-}" ]] || { err "Missing value for --name"; exit 2; }
+        name="$2"; shift 2 ;;
+      --name=*)
+        name="${1#--name=}"; shift ;;
+      -h|--help)
+        usage; return 0 ;;
+      -*)
+        err "Unknown delete option: $1"
+        usage >&2
+        exit 2 ;;
+      *)
+        if [[ -n "$name" ]]; then
+          err "Unexpected extra argument: $1"
+          exit 2
+        fi
+        name="$1"; shift ;;
+    esac
+  done
+
+  [[ -n "$name" ]] || { err "Profile name must not be empty."; err "Usage: ${0##*/} delete NAME"; exit 2; }
+
+  collect_profiles
+  if [[ ${#P_ID[@]} -eq 0 ]]; then
+    err "No Firefox profiles found."
+    exit 1
+  fi
+
+  # Resolve the profile by name.
+  local -a matches=()
+  local i
+  for i in "${!P_NAME[@]}"; do
+    [[ "${P_NAME[$i]}" == "$name" ]] && matches+=("$i")
+  done
+
+  if (( ${#matches[@]} == 0 )); then
+    err "No profile named '$name' found."
+    err "Use 'fpm.sh list' to see available profiles."
+    exit 1
+  elif (( ${#matches[@]} > 1 )); then
+    err "Multiple profiles match the name '$name':"
+    for i in "${matches[@]}"; do
+      err "  ${P_ID[$i]}  ${P_PATH[$i]}"
+    done
+    err "Refusing to delete an ambiguous name."
+    err "Use a unique profile name, then retry."
+    exit 1
+  fi
+
+  local idx="${matches[0]}"
+  local src="${P_SRC[$idx]}"
+  local id="${P_ID[$idx]}"
+  local path="${P_PATH[$idx]}"
+
+  if [[ "$id" == sqlite:* ]]; then
+    # SQLite profile group. id is sqlite:<storeid>#<id>.
+    local storeid dbid
+    storeid="${id#sqlite:}"
+    dbid="${storeid##*#}"
+    storeid="${storeid%#*}"
+    local db="$src/Profile Groups/$storeid.sqlite"
+
+    [[ -x "$SQLITE3_BIN" ]] || { err "The sqlite3 utility ($SQLITE3_BIN) is required for delete but was not found."; exit 1; }
+    [[ -e "$db" ]] || { err "Profile database not found: $db"; exit 1; }
+
+    if ! "$SQLITE3_BIN" "$db" "DELETE FROM Profiles WHERE id = $dbid;" 2>/dev/null; then
+      err "Failed to remove profile from database: $db"
+      exit 1
+    fi
+  else
+    # Legacy profiles.ini entry. Remove the matching [ProfileX] section.
+    local ini="$src/profiles.ini"
+    [[ -f "$ini" ]] || { err "profiles.ini not found: $ini"; exit 1; }
+
+    if ! awk -v target="$id" '
+      function flush() {
+        if (have && sec != target) {
+          for (i = 0; i < n; i++) print buf[i]
+          if (!printed) printed = 1
+        }
+        have = 0; n = 0
+      }
+      {
+        line = $0
+        if (line ~ /^[[:space:]]*\[[^]]+\]/) {
+          flush()
+          sec = line
+          sub(/^[[:space:]]*\[/, "", sec)
+          sub(/\][[:space:]]*$/, "", sec)
+          have = 1
+        } else if (have) {
+          buf[n++] = line
+        } else {
+          print line
+        }
+      }
+      END { flush() }
+    ' "$ini" > "$ini.tmp"; then
+      err "Failed to rewrite profiles.ini"
+      exit 1
+    fi
+    mv "$ini.tmp" "$ini"
+  fi
+
+  printf 'Deleted profile "%s" (%s) from %s\n' "$name" "$id" "$src"
+  printf 'Note: the profile directory %s was left in place.\n' "$path"
+}
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -882,6 +1014,9 @@ main() {
       ;;
     import)
       cmd_import "$@"
+      ;;
+    delete)
+      cmd_delete "$@"
       ;;
     help|-h|--help)
       usage
