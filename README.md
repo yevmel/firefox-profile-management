@@ -1,7 +1,7 @@
 # FPM — Firefox Profile Management
 
-A small Bash CLI for discovering, exporting and importing Firefox profiles on
-Linux. It understands **both** places where Firefox stores profile metadata:
+A small Bash CLI for discovering, exporting, importing and deleting Firefox
+profiles on Linux. It understands **both** places where Firefox stores profile metadata:
 
 - the legacy `profiles.ini` file, and
 - the newer SQLite-backed **Profile Groups** store.
@@ -16,6 +16,7 @@ from `profiles.ini` (see [The import challenge](#the-import-challenge)).
 | `list` | Lists every profile found (name, identifier, path). This is the default action. |
 | `export` | Zips a profile directory into the current directory. |
 | `import` | Extracts a profile archive and registers it in **both** `profiles.ini` and the embedded SQLite store. |
+| `delete` | Removes a profile completely: its `profiles.ini` entry, its SQLite store entry and its directory. |
 
 ## Requirements
 
@@ -88,6 +89,40 @@ Specify which one to import into with --dir.
 
 `--dir` accepts a full path or one of the short labels `native`, `snap`,
 `flatpak`. `--name` defaults to `Default`.
+
+### Delete a profile
+
+```bash
+./fpm.sh delete "Restored Default"
+./fpm.sh delete --name "Restored Default"
+```
+
+The profile is selected by its exact name; an ambiguous name is refused.
+`delete` removes every trace of the profile from the Firefox directory it
+belongs to:
+
+1. its rows in the `Profiles` table of every `Profile Groups/*.sqlite`
+   database (matched by relative or absolute path),
+2. its `[ProfileN]` section in `profiles.ini` — the remaining sections are
+   renumbered, because Firefox stops reading at the first missing `ProfileN`,
+3. any install default (`[Install…]` in `profiles.ini`, sections of
+   `installs.ini`) pointing to it, and
+4. the profile directory itself.
+
+```
+Deleted profile "Restored Default" (Profile2) from /home/user/.mozilla/firefox
+Removed:
+  /home/user/.mozilla/firefox/Profile Groups/9d3233fc.sqlite
+  /home/user/.mozilla/firefox/profiles.ini
+  /home/user/.mozilla/firefox/kffddu03.default-release-1
+```
+
+> **Warning:** deleting is permanent. Run `export` first if you might need the
+> profile again.
+
+`delete` refuses to touch a profile that is in use (Firefox keeps a `lock`
+symlink in the profile directory while running). Close Firefox and retry; if
+Firefox crashed and left a stale `lock` behind, remove it manually first.
 
 ## Where FPM looks
 
@@ -178,7 +213,9 @@ Getting the SQLite update right by hand is fiddly:
    database (full schema, `user_version = 7`) when none exists yet.
 
 The result is a profile that appears both in the legacy store and in the
-"Choose a Firefox profile" dialog.
+"Choose a Firefox profile" dialog. For the same reason, `fpm.sh delete` cleans
+up both stores: removing the profile from only one of them would leave it
+visible (and broken) in the other.
 
 ## Exit codes
 

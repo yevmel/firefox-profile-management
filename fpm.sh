@@ -28,9 +28,10 @@
 #                             one is found; accepts a path or native/snap/flatpak).
 #              ARCHIVE        The zip archive produced by "export".
 #
-#   delete   Delete a profile by name, removing it from profiles.ini and the
-#            SQLite profile store. The on-disk profile directory is left in
-#            place.
+#   delete   Delete a profile by name: remove it from profiles.ini (and as an
+#            install default from installs.ini), from every SQLite
+#            profile-group database, then delete the profile directory.
+#            Refuses while the profile is in use.
 #              ./fpm.sh delete NAME
 #              --name NAME    Name of the profile to delete (or pass as a
 #                             positional argument).
@@ -40,7 +41,7 @@
 
 set -euo pipefail
 
-readonly VERSION="0.4.0"
+readonly VERSION="0.5.0"
 readonly SQLITE3_BIN="${SQLITE3_BIN:-/usr/bin/sqlite3}"
 
 # ---------------------------------------------------------------------------
@@ -61,7 +62,8 @@ Commands:
           Profiles are read from both profiles.ini and the new SQLite store.
   export  Export a profile directory as a zip archive.
   import  Import a profile from a zip archive.
-  delete  Delete a profile by name (from profiles.ini and the SQLite store).
+  delete  Delete a profile by name: its profiles.ini entry, its SQLite
+          store entry and its directory.
   help    Show this help message.
 
 Export options:
@@ -78,7 +80,8 @@ Delete options:
   NAME           Name of the profile to delete.
   --name NAME    Name of the profile to delete.
 
-Note: delete removes the profile's registration; the on-disk directory is kept.
+Note: delete permanently removes the profile directory. Export it first if
+you may need it again.
 EOF
 }
 
@@ -961,6 +964,109 @@ cmd_import() {
 # Delete
 # ---------------------------------------------------------------------------
 
+# Remove every section of an INI file (profiles.ini or installs.ini) that
+# points to the given profile directory: [ProfileN] sections by their Path and
+# [Install...] sections by their Default. The remaining [ProfileN] sections are
+# renumbered, because Firefox stops reading at the first missing ProfileN.
+# Prints the number of removed sections.
+remove_ini_profile() {
+  local ini="$1" src="$2" target="$3"
+  local tmp="$ini.tmp" countfile
+  countfile="$(mktemp)"
+
+  # In installs.ini every section is an install section, named by its hash.
+  local installs=0
+  [[ "${ini##*/}" == "installs.ini" ]] && installs=1
+
+  if ! awk -v src="${src%/}" -v target="$target" -v countfile="$countfile" \
+    -v installs="$installs" '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    function resolve(p, rel) {
+      if (rel == "0") return p
+      sub(/^\/+/, "", p)
+      return src "/" p
+    }
+    function flush(   i) {
+      if (!have) return
+      if ((isprof && pth != "" && resolve(pth, isrel) == target) ||
+          (isinst && def != "" && resolve(def, def ~ /^\// ? "0" : "1") == target)) {
+        removed++
+        have = 0; n = 0
+        return
+      }
+      if (isprof) {
+        print "[Profile" next_n++ "]"
+      } else {
+        print header
+      }
+      for (i = 0; i < n; i++) print buf[i]
+      have = 0; n = 0
+    }
+    BEGIN { next_n = 0; removed = 0 }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      if (line ~ /^[[:space:]]*\[[^]]+\][[:space:]]*$/) {
+        flush()
+        header = $0
+        sec = trim(line)
+        sub(/^\[/, "", sec)
+        sub(/\]$/, "", sec)
+        have = 1
+        isprof = (sec ~ /^Profile[0-9]+$/)
+        isinst = (installs == 1 || sec ~ /^Install/)
+        pth = ""; isrel = ""; def = ""
+      } else if (have) {
+        buf[n++] = $0
+        if ((isprof || isinst) && line ~ /=/) {
+          key = trim(substr(line, 1, index(line, "=") - 1))
+          val = trim(substr(line, index(line, "=") + 1))
+          if (isprof && key == "Path") pth = val
+          else if (isprof && key == "IsRelative") isrel = val
+          else if (isinst && key == "Default") def = val
+        }
+      } else {
+        print $0
+      }
+    }
+    END {
+      flush()
+      print removed > countfile
+    }
+  ' "$ini" > "$tmp"; then
+    rm -f "$tmp" "$countfile"
+    return 1
+  fi
+
+  mv "$tmp" "$ini"
+  cat "$countfile"
+  rm -f "$countfile"
+}
+
+# Remove the rows pointing to the given profile directory from every
+# profile-group database of a Firefox directory. Paths may be stored relative
+# to the Firefox directory or absolute. Prints "<db>" for each changed database.
+remove_db_profile() {
+  local src="$1" target="$2"
+  local rel="" db changed
+  [[ "$target" == "${src%/}/"* ]] && rel="${target#"${src%/}"/}"
+
+  local t r
+  t="${target//\'/\'\'}"
+  r="${rel//\'/\'\'}"
+
+  for db in "$src"/Profile\ Groups/*.sqlite; do
+    [[ -e "$db" ]] || continue
+    if ! changed="$("$SQLITE3_BIN" "$db" \
+      "DELETE FROM Profiles WHERE path = '$t' OR (path = '$r' AND '$r' <> ''); SELECT changes();")"; then
+      err "Failed to remove profile from database: $db"
+      return 1
+    fi
+    (( ${changed:-0} > 0 )) && printf '%s\n' "$db"
+  done
+  return 0
+}
+
 cmd_delete() {
   local name=""
 
@@ -1016,62 +1122,67 @@ cmd_delete() {
   fi
 
   local idx="${matches[0]}"
-  local src="${P_SRC[$idx]}"
+  local src="${P_SRC[$idx]%/}"
   local id="${P_ID[$idx]}"
-  local path="${P_PATH[$idx]}"
+  local path="${P_PATH[$idx]%/}"
 
-  if [[ "$id" == sqlite:* ]]; then
-    # SQLite profile group. id is sqlite:<storeid>#<id>.
-    local storeid dbid
-    storeid="${id#sqlite:}"
-    dbid="${storeid##*#}"
-    storeid="${storeid%#*}"
-    local db="$src/Profile Groups/$storeid.sqlite"
+  # Never remove anything that is not plainly a profile directory.
+  case "$path" in
+    ""|"/"|"$HOME"|"$src")
+      err "Refusing to delete suspicious profile path: '$path'"
+      exit 1 ;;
+  esac
 
-    [[ -x "$SQLITE3_BIN" ]] || { err "The sqlite3 utility ($SQLITE3_BIN) is required for delete but was not found."; exit 1; }
-    [[ -e "$db" ]] || { err "Profile database not found: $db"; exit 1; }
+  # Firefox keeps a "lock" symlink in the profile while it is running.
+  if [[ -L "$path/lock" ]]; then
+    err "Profile '$name' appears to be in use ($path/lock exists)."
+    err "Close Firefox and retry. If Firefox is not running, remove the stale lock first."
+    exit 1
+  fi
 
-    if ! "$SQLITE3_BIN" "$db" "DELETE FROM Profiles WHERE id = $dbid;" 2>/dev/null; then
-      err "Failed to remove profile from database: $db"
+  local -a group_dbs=("$src"/Profile\ Groups/*.sqlite)
+  if [[ -e "${group_dbs[0]}" && ! -x "$SQLITE3_BIN" ]]; then
+    err "The sqlite3 utility ($SQLITE3_BIN) is required for delete but was not found."
+    exit 1
+  fi
+
+  local -a removed=()
+
+  # 1. The SQLite profile store (every group database of this directory).
+  local dbs db
+  if ! dbs="$(remove_db_profile "$src" "$path")"; then
+    exit 1
+  fi
+  while IFS= read -r db; do
+    [[ -n "$db" ]] && removed+=("$db")
+  done <<< "$dbs"
+
+  # 2. The legacy profiles.ini, and the install defaults in installs.ini.
+  local ini count
+  for ini in "$src/profiles.ini" "$src/installs.ini"; do
+    [[ -f "$ini" ]] || continue
+    if ! count="$(remove_ini_profile "$ini" "$src" "$path")"; then
+      err "Failed to rewrite $ini"
       exit 1
     fi
-  else
-    # Legacy profiles.ini entry. Remove the matching [ProfileX] section.
-    local ini="$src/profiles.ini"
-    [[ -f "$ini" ]] || { err "profiles.ini not found: $ini"; exit 1; }
+    (( ${count:-0} > 0 )) && removed+=("$ini")
+  done
 
-    if ! awk -v target="$id" '
-      function flush() {
-        if (have && sec != target) {
-          for (i = 0; i < n; i++) print buf[i]
-          if (!printed) printed = 1
-        }
-        have = 0; n = 0
-      }
-      {
-        line = $0
-        if (line ~ /^[[:space:]]*\[[^]]+\]/) {
-          flush()
-          sec = line
-          sub(/^[[:space:]]*\[/, "", sec)
-          sub(/\][[:space:]]*$/, "", sec)
-          have = 1
-        } else if (have) {
-          buf[n++] = line
-        } else {
-          print line
-        }
-      }
-      END { flush() }
-    ' "$ini" > "$ini.tmp"; then
-      err "Failed to rewrite profiles.ini"
+  # 3. The profile directory itself.
+  if [[ -d "$path" ]]; then
+    if ! rm -rf -- "$path"; then
+      err "Failed to remove profile directory: $path"
       exit 1
     fi
-    mv "$ini.tmp" "$ini"
+    removed+=("$path")
   fi
 
   printf 'Deleted profile "%s" (%s) from %s\n' "$name" "$id" "$src"
-  printf 'Note: the profile directory %s was left in place.\n' "$path"
+  printf 'Removed:\n'
+  local r
+  for r in "${removed[@]}"; do
+    printf '  %s\n' "$r"
+  done
 }
 
 # ---------------------------------------------------------------------------
