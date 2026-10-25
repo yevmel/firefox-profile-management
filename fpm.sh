@@ -3,7 +3,8 @@
 # fpm.sh - Firefox Profile Management
 #
 # Manages Firefox profiles found in the user's home directory. It checks the
-# common Firefox locations, including Firefox installed via snap and flatpak.
+# common Firefox locations, including Firefox installed via snap and flatpak
+# on Linux and the standard location on macOS.
 # Both profile backends are supported:
 #   * the legacy profiles.ini file
 #   * the new SQLite-backed profile store ("Profile Groups")
@@ -25,7 +26,8 @@
 #              ./fpm.sh import [--name NAME] [--dir DIR] ARCHIVE.zip
 #              --name NAME    Name for the imported profile (default: Default).
 #              --dir DIR      Target Firefox directory (required if more than
-#                             one is found; accepts a path or native/snap/flatpak).
+#                             one is found; accepts a path or
+#                             native/snap/flatpak/macos).
 #              ARCHIVE        The zip archive produced by "export".
 #
 #   delete   Delete a profile by name: remove it from profiles.ini (and as an
@@ -40,6 +42,10 @@
 #              ./fpm.sh help
 
 set -euo pipefail
+
+# Written for bash 3.2 (the version shipped with macOS): no associative
+# arrays, and arrays that may be empty are expanded as ${a[@]+"${a[@]}"},
+# because bash < 4.4 treats "${a[@]}" of an empty array as unbound under -u.
 
 readonly VERSION="0.5.0"
 readonly SQLITE3_BIN="${SQLITE3_BIN:-/usr/bin/sqlite3}"
@@ -74,6 +80,7 @@ Export options:
 Import options:
   --name NAME    Name for the imported profile (default: Default).
   --dir DIR      Target Firefox directory (required if more than one exists).
+                 A path, or one of: native, snap, flatpak, macos.
   ARCHIVE        The zip archive to import.
 
 Delete options:
@@ -91,7 +98,6 @@ EOF
 # ---------------------------------------------------------------------------
 
 declare -a P_SRC=() P_ID=() P_NAME=() P_PATH=() P_DEFAULT=() SRC_ORDER=()
-declare -A SEEN=()
 TARGET_DIR=""
 
 # ---------------------------------------------------------------------------
@@ -105,7 +111,8 @@ known_firefox_dirs() {
     "$HOME/.config/mozilla/firefox" \
     "$HOME/.mozilla/firefox" \
     "$HOME/snap/firefox/common/.mozilla/firefox" \
-    "$HOME/.var/app/org.mozilla.firefox/.mozilla/firefox"; do
+    "$HOME/.var/app/org.mozilla.firefox/.mozilla/firefox" \
+    "$HOME/Library/Application Support/Firefox"; do
     [[ -n "$d" ]] && printf '%s\n' "$d"
   done
 
@@ -153,6 +160,8 @@ describe_source() {
     printf 'snap (%s)' "$d"
   elif [[ "$d" == "$HOME/.var/app/org.mozilla.firefox/.mozilla/firefox" ]]; then
     printf 'flatpak (%s)' "$d"
+  elif [[ "$d" == "$HOME/Library/Application Support/Firefox" ]]; then
+    printf 'macos (%s)' "$d"
   else
     printf '%s' "$d"
   fi
@@ -160,7 +169,7 @@ describe_source() {
 
 add_source() {
   local src="$1" e
-  for e in "${SRC_ORDER[@]}"; do
+  for e in ${SRC_ORDER[@]+"${SRC_ORDER[@]}"}; do
     [[ "$e" == "$src" ]] && return
   done
   SRC_ORDER+=("$src")
@@ -172,7 +181,7 @@ add_source() {
 
 emit_profile() {
   local src="$1" id="$2" name="$3" path="$4" isrel="$5" default="$6" base="$7"
-  local full
+  local full p
 
   if [[ "$isrel" == "0" ]]; then
     full="$path"
@@ -183,8 +192,9 @@ emit_profile() {
 
   # The same profile directory may be listed both by profiles.ini and by a
   # SQLite profile-group database. Keep the first occurrence only.
-  [[ -n "${SEEN[$full]:-}" ]] && return 0
-  SEEN[$full]=1
+  for p in ${P_PATH[@]+"${P_PATH[@]}"}; do
+    [[ "$p" == "$full" ]] && return 0
+  done
 
   P_SRC+=("$src")
   P_ID+=("$id")
@@ -318,7 +328,7 @@ print_profiles() {
   local src i j
   local -a idx=()
 
-  for src in "${SRC_ORDER[@]}"; do
+  for src in ${SRC_ORDER[@]+"${SRC_ORDER[@]}"}; do
     idx=()
     for i in "${!P_SRC[@]}"; do
       [[ "${P_SRC[$i]}" == "$src" ]] && idx+=("$i")
@@ -373,7 +383,7 @@ cmd_list() {
 
   if [[ ${#P_ID[@]} -eq 0 ]]; then
     err "No Firefox profiles found."
-    err "Checked the common Firefox locations (native, snap, flatpak)."
+    err "Checked the common Firefox locations (native, snap, flatpak, macos)."
     err "Both profiles.ini and the SQLite profile store were inspected."
     exit 1
   fi
@@ -506,6 +516,7 @@ resolve_dir_arg() {
     native)  printf '%s' "$HOME/.mozilla/firefox" ;;
     snap)    printf '%s' "$HOME/snap/firefox/common/.mozilla/firefox" ;;
     flatpak) printf '%s' "$HOME/.var/app/org.mozilla.firefox/.mozilla/firefox" ;;
+    macos)   printf '%s' "$HOME/Library/Application Support/Firefox" ;;
     *)       printf '%s' "$1" ;;
   esac
 }
@@ -547,8 +558,7 @@ resolve_target_dir() {
 # Return the single top-level directory name contained in a zip archive.
 zip_top_dir() {
   local zipfile="$1"
-  local entry top
-  local -A seen=()
+  local entry top d known
   local -a dirs=() files=()
 
   while IFS= read -r entry; do
@@ -556,9 +566,11 @@ zip_top_dir() {
     if [[ "$entry" == */* ]]; then
       top="${entry%%/*}"
       [[ -n "$top" ]] || continue
-      [[ -n "${seen[$top]:-}" ]] && continue
-      seen[$top]=1
-      dirs+=("$top")
+      known=0
+      for d in ${dirs[@]+"${dirs[@]}"}; do
+        [[ "$d" == "$top" ]] && { known=1; break; }
+      done
+      (( known )) || dirs+=("$top")
     else
       files+=("$entry")
     fi
@@ -1133,10 +1145,18 @@ cmd_delete() {
       exit 1 ;;
   esac
 
-  # Firefox keeps a "lock" symlink in the profile while it is running.
+  # On Linux, Firefox keeps a "lock" symlink in the profile while it is
+  # running. On macOS the ".parentlock" file stays around after Firefox exits,
+  # so check whether a process still holds it open instead.
   if [[ -L "$path/lock" ]]; then
     err "Profile '$name' appears to be in use ($path/lock exists)."
     err "Close Firefox and retry. If Firefox is not running, remove the stale lock first."
+    exit 1
+  fi
+  if [[ -e "$path/.parentlock" ]] && command -v lsof >/dev/null 2>&1 \
+    && lsof -t -- "$path/.parentlock" >/dev/null 2>&1; then
+    err "Profile '$name' appears to be in use ($path/.parentlock is held open)."
+    err "Close Firefox and retry."
     exit 1
   fi
 
@@ -1180,7 +1200,7 @@ cmd_delete() {
   printf 'Deleted profile "%s" (%s) from %s\n' "$name" "$id" "$src"
   printf 'Removed:\n'
   local r
-  for r in "${removed[@]}"; do
+  for r in ${removed[@]+"${removed[@]}"}; do
     printf '  %s\n' "$r"
   done
 }
